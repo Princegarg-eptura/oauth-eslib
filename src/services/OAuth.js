@@ -120,7 +120,7 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
    *                   promises are called `loadSite`, `exitSite` and
    *                   `loadToken`.
    */
-  function login(params) {
+  function login(params, isIOS, iOSAWAS) {
 
     params.state = params.state || (new Date()).valueOf();
     if (oaHost.storeHost(params) === null) {
@@ -136,7 +136,7 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
         response_type: params.responseType || 'code'
       }),
       redirectUri = oaHost.redirectUri,
-      isMobile = (typeof window.cordova !== 'undefined' || document.location.href.indexOf('file://') === 0 || document.location.href.indexOf('https://localhost') === 0),
+      isMobile = (document.location.href.indexOf('file://') === 0 || !!window.cordova || document.location.hostname === 'localhost'),
       isHostSite = function(url) {
         return (url.indexOf(oaHost.site) === 0);
       },
@@ -166,6 +166,26 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
         window.localStorage['oauth-query'] = JSON.stringify(queryParams);
       },
       setupInAppBrowserListeners = function(ref, loadTokenTask, loadSiteTask, exitSiteTask) {
+
+        // Regular browser popup (localhost dev): use window.postMessage instead of
+        // InAppBrowser loadstart events, which don't exist on a standard popup window.
+        // The oauth2redirect.html page posts { type: 'oauth-redirect', url: <full href> }
+        // after the dev redirect server forwards the callback to localhost:8100.
+        if (document.location.hostname === 'localhost') {
+          var messageHandler = function(event) {
+            if (!event.data || event.data.type !== 'oauth-redirect') return;
+            window.removeEventListener('message', messageHandler);
+            var url = event.data.url;
+            var queryIdx = url.indexOf('?');
+            var query = queryIdx !== -1 ? url.substring(queryIdx + 1) : '';
+            exitSiteTask.resolve();
+            loadSiteTask.resolve('load_success');
+            if (ref && !ref.closed) ref.close();
+            processQuery(query, loadTokenTask);
+          };
+          window.addEventListener('message', messageHandler);
+          return;
+        }
 
         function iabLoadStart(event) {
           if (isAppSite(event.url)) {
@@ -214,17 +234,76 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
         ref.addEventListener('loaderror', iabLoadError);
         ref.addEventListener('exit', iabClose);
 
+      },
+
+      // setupSystemBrowserListeners: used on device with _system browser.
+      // cordova-plugin-customurlscheme fires window.handleOpenURL(url) when the
+      // iomaintenance:// deep link is opened. index.html stores the URL in
+      // localStorage['launchUrl'] and postMessages 'oauth2redirectfromsystembrowser-ready'.
+      setupSystemBrowserListeners = function(loadTokenTask, exitSiteTask) {
+        function onSystemBrowserRedirect(event) {
+          if (event.data !== 'oauth2redirectfromsystembrowser-ready') return;
+          window.removeEventListener('message', onSystemBrowserRedirect);
+          try {
+            var stored = JSON.parse(window.localStorage.getItem('launchUrl') || 'null');
+            if (stored && stored.data) {
+              var storedUrl = stored.data;
+              var query = storedUrl.substring(redirectUri.length + 1);
+              window.localStorage.removeItem('launchUrl');
+              processQuery(query, loadTokenTask);
+              exitSiteTask.resolve('system_browser_redirect');
+            } else {
+              loadTokenTask.reject('no_launch_url');
+            }
+          } catch (e) {
+            loadTokenTask.reject('parse_error');
+          }
+        }
+        window.addEventListener('message', onSystemBrowserRedirect);
       };
 
-    // For mobile environments, skip the HTTP pre-check as it can fail due to CORS/network policies
-    // The InAppBrowser will handle loading errors itself
-    if (isMobile) {
-      oaLog.debug('OAuth.login', 'Mobile environment detected, opening InAppBrowser directly...');
-      var ref = window.open(url, '_blank', 'location=no,hidden=yes,toolbarposition=top,closebuttoncaption=Cancel');
+    oaLog.debug('OAuth.login', 'Checking for site availability...');
+    if (isIOS && iOSAWAS) {
+      // iOS 12+: use ASWebAuthenticationSession — handles the custom URL scheme redirect
+      // internally without needing handleOpenURL or a system browser workaround.
+      oaLog.debug('OAuth.login', 'iOS: using ASWebAuthenticationSession.');
+      task.loadSite.resolve('aswebauth_start');
+      iOSAWAS.start('iomaintenance', url)
+        .then(function(redirectUrl) {
+          var query = '';
+          if (redirectUrl.indexOf('#') > -1) query = redirectUrl.split('#')[1];
+          else if (redirectUrl.indexOf('?') > -1) query = redirectUrl.split('?')[1];
+          else query = redirectUrl.replace(redirectUri + '#', '').replace(redirectUri + '?', '');
+          processQuery(query, task.loadToken);
+          task.exitSite.resolve('aswebauth_complete');
+        })
+        .catch(function(err) {
+          console.error('[OAuth] ASWebAuthenticationSession error:', err);
+          task.loadSite.reject('aswebauth_error');
+          task.loadToken.reject('aswebauth_error');
+          task.exitSite.resolve('aswebauth_cancelled');
+        });
+    // In a browser (localhost dev via ionic serve, no cordova), skip the cross-origin XHR
+    // site check. NOTE: on device, content is also served from https://localhost/ but
+    // window.cordova IS defined — must NOT use the popup path there.
+    } else if (document.location.hostname === 'localhost' && !window.cordova) {
+      oaLog.debug('OAuth.login', 'localhost: skipping CORS-blocked site check.');
+      var ref = window.open(url, '_blank', 'location=yes,toolbar=yes,width=600,height=700');
+      // loadSite resolves immediately — we can't detect popup load in browser mode,
+      // so hide the connecting spinner right away.
+      task.loadSite.resolve('load_success');
       setupInAppBrowserListeners(ref, task.loadToken, task.loadSite, task.exitSite);
+    } else if (isMobile) {
+      // On device: open the system browser so Android can handle the iomaintenance://
+      // redirect as a deep link (via cordova-plugin-customurlscheme → handleOpenURL).
+      oaLog.debug('OAuth.login', 'Mobile: opening system browser for OAuth.');
+      var openSystemBrowser = (window.cordova && window.cordova.InAppBrowser)
+        ? window.cordova.InAppBrowser.open.bind(window.cordova.InAppBrowser)
+        : window.open.bind(window);
+      openSystemBrowser(url, '_system');
+      setTimeout(function() { task.loadSite.resolve('browser_opened'); }, 500);
+      setupSystemBrowserListeners(task.loadToken, task.exitSite);
     } else {
-      // For non-mobile (browser), do the pre-check
-      oaLog.debug('OAuth.login', 'Checking for site availability...');
       $http({
         method: 'GET',
         url: url
@@ -368,7 +447,6 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
     oaLog.debug('OAuth', 'Access is unavailable -> ' + location);
 
     if (typeof getHostService().onAccessDenied === 'function') {
-      console.log('OAuth accessUnavailable', typeof getHostService().onAccessDenied);
       getHostService().onAccessDenied("host_offline", location);
     }
 
@@ -499,7 +577,6 @@ function OAuth(oaToken, oaHost, oaHash, oaLog, $q, $http) {
   function onAccessDenied(reason) {
     accessDenied(reason);
     if (typeof getHostService().onAccessDenied == 'function') {
-      console.log('OAuth onAccessDenied', typeof getHostService().onAccessDenied);
       getHostService().onAccessDenied(reason);
     }
   }
